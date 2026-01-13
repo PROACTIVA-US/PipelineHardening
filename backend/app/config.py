@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     github_repo_name: str = os.getenv("GITHUB_REPO_NAME", "PipelineHardening")
 
     # Execution
-    repo_path: str = str(Path(__file__).parent.parent.parent.parent)  # Project root
+    repo_path: str = str(Path(__file__).parent.parent.parent)  # Project root (backend -> app -> config.py)
 
     # Server
     host: str = "0.0.0.0"
