@@ -6,6 +6,12 @@ from app.models.autonomous import (
     BatchStatus,
     TaskStatus,
 )
+from app.models.parallel import (
+    ParallelTestSession,
+    ParallelTestExecution,
+    ParallelSessionStatus,
+    ParallelTestStatus,
+)
 
 __all__ = [
     "AutonomousSession",
@@ -14,4 +20,8 @@ __all__ = [
     "SessionStatus",
     "BatchStatus",
     "TaskStatus",
+    "ParallelTestSession",
+    "ParallelTestExecution",
+    "ParallelSessionStatus",
+    "ParallelTestStatus",
 ]
