@@ -67,10 +67,15 @@ class TaskExecutor:
     Executes individual tasks using Claude Code CLI.
 
     The minimal pipeline executor that:
-    1. Creates a branch
+    1. Creates a branch (or uses provided worktree)
     2. Runs `claude` CLI with the task prompt
     3. Commits changes
     4. Creates and merges PR
+
+    For parallel execution, use with WorktreePool:
+    - WorktreePool creates isolated worktrees with branches
+    - Pass worktree path to execute_task()
+    - Each task runs in isolation - no git conflicts
     """
 
     def __init__(
@@ -104,6 +109,8 @@ class TaskExecutor:
         verification_steps: List[str],
         batch_number: int = 1,
         auto_merge: bool = True,
+        worktree_path: Optional[Path] = None,
+        branch_name: Optional[str] = None,
     ) -> ExecutionResult:
         """
         Execute a single task end-to-end.
@@ -116,23 +123,40 @@ class TaskExecutor:
             verification_steps: Commands to verify success
             batch_number: Batch this task belongs to
             auto_merge: Whether to merge PR automatically
+            worktree_path: Path to worktree for isolated execution.
+                          If provided, skips branch creation (worktree already has branch).
+                          If None, uses legacy _create_branch (not recommended).
+            branch_name: Branch name (required if worktree_path provided).
 
         Returns:
             ExecutionResult with success status and details
         """
         start_time = datetime.now(timezone.utc)
-        branch_name = self._generate_branch_name(batch_number, task_number)
+
+        # Use provided branch name or generate one
+        if branch_name is None:
+            branch_name = self._generate_branch_name(batch_number, task_number)
+
+        # Determine execution path (worktree or repo_path)
+        exec_path = worktree_path if worktree_path else self.repo_path
+
         claude_output = ""
 
         try:
-            # 1. Create feature branch
-            logger.info(f"[Task {task_number}] Creating branch: {branch_name}")
-            await self._create_branch(branch_name)
+            # 1. Create feature branch (only if NOT using worktree)
+            # Worktrees already have their branch set up by WorktreePool
+            if worktree_path:
+                logger.info(f"[Task {task_number}] Using worktree: {worktree_path} (branch: {branch_name})")
+            else:
+                # DEPRECATED: This path has git corruption bugs with parallel execution
+                logger.warning(f"[Task {task_number}] Using legacy _create_branch - NOT RECOMMENDED for parallel execution")
+                logger.info(f"[Task {task_number}] Creating branch: {branch_name}")
+                await self._create_branch(branch_name)
 
             # 2. Build prompt and execute with Claude
             logger.info(f"[Task {task_number}] Executing with Claude CLI...")
             prompt = self._build_prompt(task_number, task_title, implementation, files, verification_steps)
-            claude_output = await self._execute_with_claude(prompt, branch_name)
+            claude_output = await self._execute_with_claude(prompt, branch_name, exec_path)
 
             # 3. Commit and push
             logger.info(f"[Task {task_number}] Committing changes...")
@@ -140,6 +164,7 @@ class TaskExecutor:
                 branch_name=branch_name,
                 task_number=task_number,
                 task_title=task_title,
+                exec_path=exec_path,
             )
 
             if not commit_sha:
@@ -298,12 +323,24 @@ class TaskExecutor:
 
         return "\n".join(prompt_parts)
 
-    async def _execute_with_claude(self, prompt: str, branch_name: str) -> str:
-        """Execute task using Claude Code CLI."""
-        logger.info(f"Executing Claude CLI with prompt ({len(prompt)} chars)...")
+    async def _execute_with_claude(
+        self,
+        prompt: str,
+        branch_name: str,
+        exec_path: Optional[Path] = None,
+    ) -> str:
+        """Execute task using Claude Code CLI.
+
+        Args:
+            prompt: Task prompt to execute
+            branch_name: Git branch name (for logging)
+            exec_path: Path to execute in (worktree or repo). Uses self.repo_path if None.
+        """
+        work_path = exec_path if exec_path else self.repo_path
+        logger.info(f"Executing Claude CLI with prompt ({len(prompt)} chars) in {work_path}...")
 
         # Write prompt to temp file
-        prompt_file = self.repo_path / ".claude_prompt.md"
+        prompt_file = work_path / ".claude_prompt.md"
         prompt_file.write_text(prompt)
 
         try:
@@ -311,7 +348,7 @@ class TaskExecutor:
             # Using --print for non-interactive mode, -p for prompt from stdin
             result = subprocess.run(
                 ["claude", "--print", "-p", prompt],
-                cwd=str(self.repo_path),
+                cwd=str(work_path),
                 capture_output=True,
                 text=True,
                 timeout=1800,  # 30 minute timeout
@@ -341,13 +378,23 @@ class TaskExecutor:
         branch_name: str,
         task_number: str,
         task_title: str,
+        exec_path: Optional[Path] = None,
     ) -> Tuple[Optional[str], List[str]]:
-        """Commit changes and push to remote."""
+        """Commit changes and push to remote.
+
+        Args:
+            branch_name: Git branch name
+            task_number: Task identifier for commit message
+            task_title: Task title for commit message
+            exec_path: Path to execute in (worktree or repo). Uses self.repo_path if None.
+        """
+        work_path = exec_path if exec_path else self.repo_path
+
         try:
             # Check for changes
             result = subprocess.run(
                 ["git", "status", "--porcelain"],
-                cwd=str(self.repo_path),
+                cwd=str(work_path),
                 capture_output=True,
                 text=True,
                 check=True,
@@ -362,7 +409,7 @@ class TaskExecutor:
             # Stage all changes
             subprocess.run(
                 ["git", "add", "-A"],
-                cwd=str(self.repo_path),
+                cwd=str(work_path),
                 capture_output=True,
                 check=True,
             )
@@ -376,7 +423,7 @@ class TaskExecutor:
 
             subprocess.run(
                 ["git", "commit", "-m", commit_msg],
-                cwd=str(self.repo_path),
+                cwd=str(work_path),
                 capture_output=True,
                 check=True,
             )
@@ -384,7 +431,7 @@ class TaskExecutor:
             # Get commit SHA
             result = subprocess.run(
                 ["git", "rev-parse", "HEAD"],
-                cwd=str(self.repo_path),
+                cwd=str(work_path),
                 capture_output=True,
                 text=True,
                 check=True,
@@ -394,7 +441,7 @@ class TaskExecutor:
             # Push
             subprocess.run(
                 ["git", "push", "-u", "origin", branch_name],
-                cwd=str(self.repo_path),
+                cwd=str(work_path),
                 capture_output=True,
                 check=True,
             )

@@ -2,11 +2,14 @@
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Optional
 from datetime import datetime, timezone
 
 from .test_queue import TestQueue, TestRequest, TestResult, TestStatus
 from .worktree_pool import WorktreePool, WorktreeInfo
+from .plan_parser import PlanParser, PlanParseError
+from .task_executor import TaskExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -198,9 +201,8 @@ class ExecutionWorker:
         )
 
         try:
-            # TODO: Integrate with actual TestHarnessService
-            # For now, simulate test execution
-            result = await self._run_test_simulation(
+            # Execute tasks from the plan in the worktree
+            result = await self._run_tasks_in_worktree(
                 test_request, worktree, started_at
             )
 
@@ -230,35 +232,106 @@ class ExecutionWorker:
                 duration_seconds=duration,
             )
 
-    async def _run_test_simulation(
+    async def _run_tasks_in_worktree(
         self,
         test_request: TestRequest,
         worktree: WorktreeInfo,
         started_at: datetime,
     ) -> TestResult:
         """
-        Simulate test execution (placeholder for real implementation).
+        Execute tasks from the plan file in the worktree.
 
         Args:
-            test_request: Test request to execute
-            worktree: Worktree to execute in
+            test_request: Test request containing plan file path
+            worktree: Worktree to execute in (provides isolation)
             started_at: Test start time
 
         Returns:
-            TestResult with simulated execution details
+            TestResult with execution details
         """
-        # Simulate some work
-        await asyncio.sleep(0.1)
+        tasks_passed = 0
+        tasks_failed = 0
+        error_msg = None
+
+        try:
+            # 1. Parse the plan file to get tasks
+            logger.info(f"Worker {self.worker_id} parsing plan: {test_request.plan_file}")
+            parser = PlanParser(test_request.plan_file)
+            batches = parser.parse()
+
+            if not batches:
+                raise PlanParseError("No batches found in plan file")
+
+            # 2. Create TaskExecutor with worktree path
+            executor = TaskExecutor(
+                repo_path=str(worktree.path),
+                github_token=test_request.config.github_token,
+            )
+
+            # 3. Execute each task in each batch
+            for batch in batches:
+                logger.info(
+                    f"Worker {self.worker_id} executing batch {batch.number}: "
+                    f"{batch.title} ({len(batch.tasks)} tasks)"
+                )
+
+                for task in batch.tasks:
+                    logger.info(
+                        f"Worker {self.worker_id} executing task {task.number}: {task.title}"
+                    )
+
+                    try:
+                        result = await executor.execute_task(
+                            task_number=task.number,
+                            task_title=task.title,
+                            implementation=task.implementation,
+                            files=task.files,
+                            verification_steps=task.verification_steps,
+                            batch_number=batch.number,
+                            auto_merge=test_request.config.auto_merge,
+                            worktree_path=worktree.path,
+                            branch_name=worktree.branch,
+                        )
+
+                        if result.success:
+                            tasks_passed += 1
+                            logger.info(
+                                f"Worker {self.worker_id} task {task.number} PASSED "
+                                f"(PR: {result.pr_url})"
+                            )
+                        else:
+                            tasks_failed += 1
+                            logger.error(
+                                f"Worker {self.worker_id} task {task.number} FAILED: "
+                                f"{result.error}"
+                            )
+
+                    except Exception as e:
+                        tasks_failed += 1
+                        logger.error(
+                            f"Worker {self.worker_id} task {task.number} exception: {e}"
+                        )
+
+        except PlanParseError as e:
+            error_msg = f"Plan parse error: {e}"
+            logger.error(f"Worker {self.worker_id} {error_msg}")
+
+        except Exception as e:
+            error_msg = f"Execution error: {e}"
+            logger.error(f"Worker {self.worker_id} {error_msg}")
 
         completed_at = datetime.now(timezone.utc)
         duration = (completed_at - started_at).total_seconds()
 
+        status = "COMPLETE" if tasks_failed == 0 and not error_msg else "FAILED"
+
         return TestResult(
             test_request_id=test_request.id,
             worktree_id=worktree.id,
-            status="COMPLETE",
-            tasks_passed=5,  # Simulated
-            tasks_failed=0,
+            status=status,
+            tasks_passed=tasks_passed,
+            tasks_failed=tasks_failed,
+            error=error_msg,
             started_at=started_at,
             completed_at=completed_at,
             duration_seconds=duration,
