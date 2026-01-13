@@ -205,6 +205,17 @@ class WorktreePool:
         Args:
             worktree: WorktreeInfo to clean
         """
+        # Check if worktree path exists before attempting cleanup
+        if not worktree.path.exists():
+            logger.warning(f"Worktree path {worktree.path} does not exist, skipping cleanup")
+            return
+
+        # Check if it's a git repository
+        git_dir = worktree.path / ".git"
+        if not git_dir.exists():
+            logger.warning(f"Worktree {worktree.id} is not a git repository, skipping git cleanup")
+            return
+
         try:
             # Checkout main to ensure clean state
             subprocess.run(
