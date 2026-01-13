@@ -25,8 +25,8 @@ env/
 *.swp
 *.swo
 
-# Test artifacts
-test-artifacts/
+# Test artifacts (not ignored - needed for E2E tests)
+# test-artifacts/
 *.log
 
 # Coverage
