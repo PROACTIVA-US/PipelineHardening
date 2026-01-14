@@ -27,7 +27,8 @@ class ParallelTestConfig:
     max_retries_per_test: int = 2
 
     # Worker settings
-    worker_timeout_minutes: int = 30
+    worker_task_timeout_seconds: float = 1800.0  # 30 minutes per task
+    worktree_acquire_timeout_seconds: float = 300.0  # 5 minutes to acquire worktree
 
     # Cleanup settings
     cleanup_on_completion: bool = True
@@ -121,12 +122,14 @@ class ParallelTestOrchestrator:
         # Initialize worktree pool
         await self.pool.initialize()
 
-        # Create workers
+        # Create workers with configured timeouts
         for i in range(1, self.config.num_workers + 1):
             worker = ExecutionWorker(
                 worker_id=f"worker-{i}",
                 queue=self.queue,
                 pool=self.pool,
+                task_timeout_seconds=self.config.worker_task_timeout_seconds,
+                worktree_acquire_timeout=self.config.worktree_acquire_timeout_seconds,
             )
             self.workers.append(worker)
 

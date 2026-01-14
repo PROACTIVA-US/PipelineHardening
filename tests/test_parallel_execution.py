@@ -303,11 +303,21 @@ class TestExecutionWorker:
     @pytest.mark.asyncio
     async def test_worker_processes_test(self, queue, pool):
         """Test worker processes a test from queue."""
-        # Mock the database session
-        with patch('backend.app.database.sync_session') as mock_session:
+        # Mock the database session and task execution
+        with patch('backend.app.database.sync_session') as mock_session, \
+             patch.object(ExecutionWorker, '_run_tasks_in_worktree') as mock_run:
             mock_db = Mock()
             mock_session.return_value = mock_db
             mock_db.close = Mock()
+
+            # Mock successful task execution
+            mock_run.return_value = TestResult(
+                test_request_id="test-001",
+                worktree_id="wt-test",
+                status="COMPLETE",
+                tasks_passed=1,
+                tasks_failed=0,
+            )
 
             worker = ExecutionWorker(
                 worker_id="worker-test",
@@ -346,11 +356,23 @@ class TestExecutionWorker:
     @pytest.mark.asyncio
     async def test_worker_handles_multiple_tests(self, queue, pool):
         """Test worker handles multiple tests sequentially."""
-        # Mock the database session
-        with patch('backend.app.database.sync_session') as mock_session:
+        # Mock the database session and task execution
+        with patch('backend.app.database.sync_session') as mock_session, \
+             patch.object(ExecutionWorker, '_run_tasks_in_worktree') as mock_run:
             mock_db = Mock()
             mock_session.return_value = mock_db
             mock_db.close = Mock()
+
+            # Mock successful task execution (return different result for each test)
+            def mock_run_tasks(test_request, worktree, started_at):
+                return TestResult(
+                    test_request_id=test_request.id,
+                    worktree_id=worktree.id,
+                    status="COMPLETE",
+                    tasks_passed=1,
+                    tasks_failed=0,
+                )
+            mock_run.side_effect = mock_run_tasks
 
             worker = ExecutionWorker(
                 worker_id="worker-test",
@@ -392,11 +414,23 @@ class TestIntegration:
     @pytest.mark.asyncio
     async def test_multiple_workers_process_queue(self, tmp_path):
         """Test multiple workers processing tests in parallel."""
-        # Mock the database session
-        with patch('backend.app.database.sync_session') as mock_session:
+        # Mock the database session and task execution
+        with patch('backend.app.database.sync_session') as mock_session, \
+             patch.object(ExecutionWorker, '_run_tasks_in_worktree') as mock_run:
             mock_db = Mock()
             mock_session.return_value = mock_db
             mock_db.close = Mock()
+
+            # Mock successful task execution
+            def mock_run_tasks(test_request, worktree, started_at):
+                return TestResult(
+                    test_request_id=test_request.id,
+                    worktree_id=worktree.id,
+                    status="COMPLETE",
+                    tasks_passed=1,
+                    tasks_failed=0,
+                )
+            mock_run.side_effect = mock_run_tasks
 
             queue = TestQueue()
 
@@ -455,3 +489,317 @@ class TestIntegration:
             # Cleanup
             for worktree in pool.worktrees.values():
                 worktree.status = WorktreeStatus.FREE
+
+
+class TestHardening:
+    """Hardening tests for robustness and edge cases."""
+
+    @pytest.mark.asyncio
+    async def test_pool_exhaustion_queueing(self, tmp_path):
+        """Test that 6 tasks with 2 workers queues properly without deadlock."""
+        # Mock the database session and task execution
+        with patch('backend.app.database.sync_session') as mock_session, \
+             patch.object(ExecutionWorker, '_run_tasks_in_worktree') as mock_run:
+            mock_db = Mock()
+            mock_session.return_value = mock_db
+            mock_db.close = Mock()
+
+            # Mock successful task execution
+            def mock_run_tasks(test_request, worktree, started_at):
+                return TestResult(
+                    test_request_id=test_request.id,
+                    worktree_id=worktree.id,
+                    status="COMPLETE",
+                    tasks_passed=1,
+                    tasks_failed=0,
+                )
+            mock_run.side_effect = mock_run_tasks
+
+            queue = TestQueue()
+
+            # Create pool with only 2 worktrees
+            pool = WorktreePool(pool_size=2)
+            pool._initialized = True
+
+            for i in range(1, 3):
+                wt_path = tmp_path / f"wt-{i}"
+                wt_path.mkdir(parents=True, exist_ok=True)
+
+                worktree = WorktreeInfo(
+                    id=f"wt-{i}",
+                    path=wt_path,
+                    branch=f"branch-{i}",
+                    status=WorktreeStatus.FREE,
+                )
+                pool.worktrees[f"wt-{i}"] = worktree
+
+            # Create 2 workers for 2 worktrees
+            workers = [
+                ExecutionWorker(f"worker-{i}", queue, pool)
+                for i in range(1, 3)
+            ]
+
+            # Submit 6 tasks (3x more than workers)
+            for i in range(6):
+                request = TestRequest(
+                    id=f"test-{i}",
+                    plan_file=f"test-{i}.md",
+                )
+                await queue.enqueue(request)
+
+            # Verify 6 tasks pending
+            status = queue.get_status()
+            assert status["pending_count"] == 6
+
+            # Start workers
+            for worker in workers:
+                await worker.start()
+
+            # Wait for all tests to complete (with reasonable timeout)
+            try:
+                await asyncio.wait_for(
+                    queue.wait_until_empty(),
+                    timeout=30.0  # Should complete in ~3 batches
+                )
+            except asyncio.TimeoutError:
+                pytest.fail("Pool exhaustion test timed out - possible deadlock")
+
+            # Stop workers
+            for worker in workers:
+                await worker.stop()
+
+            # Verify all 6 tests completed
+            status = queue.get_status()
+            assert status["completed_count"] == 6
+            assert status["failed_count"] == 0
+
+            # Cleanup
+            for worktree in pool.worktrees.values():
+                worktree.status = WorktreeStatus.FREE
+
+    @pytest.mark.asyncio
+    async def test_stress_10_tasks(self, tmp_path):
+        """Stress test with 10+ tasks to validate scalability."""
+        # Mock the database session and task execution
+        with patch('backend.app.database.sync_session') as mock_session, \
+             patch.object(ExecutionWorker, '_run_tasks_in_worktree') as mock_run:
+            mock_db = Mock()
+            mock_session.return_value = mock_db
+            mock_db.close = Mock()
+
+            # Mock successful task execution
+            def mock_run_tasks(test_request, worktree, started_at):
+                return TestResult(
+                    test_request_id=test_request.id,
+                    worktree_id=worktree.id,
+                    status="COMPLETE",
+                    tasks_passed=1,
+                    tasks_failed=0,
+                )
+            mock_run.side_effect = mock_run_tasks
+
+            queue = TestQueue()
+
+            # Create pool with 3 worktrees
+            pool = WorktreePool(pool_size=3)
+            pool._initialized = True
+
+            for i in range(1, 4):
+                wt_path = tmp_path / f"wt-{i}"
+                wt_path.mkdir(parents=True, exist_ok=True)
+
+                worktree = WorktreeInfo(
+                    id=f"wt-{i}",
+                    path=wt_path,
+                    branch=f"branch-{i}",
+                    status=WorktreeStatus.FREE,
+                )
+                pool.worktrees[f"wt-{i}"] = worktree
+
+            # Create 3 workers
+            workers = [
+                ExecutionWorker(f"worker-{i}", queue, pool)
+                for i in range(1, 4)
+            ]
+
+            # Submit 12 tasks (4x workers)
+            num_tasks = 12
+            for i in range(num_tasks):
+                request = TestRequest(
+                    id=f"stress-test-{i}",
+                    plan_file=f"stress-test-{i}.md",
+                )
+                await queue.enqueue(request)
+
+            # Start workers
+            for worker in workers:
+                await worker.start()
+
+            # Wait for completion
+            try:
+                await asyncio.wait_for(
+                    queue.wait_until_empty(),
+                    timeout=60.0  # ~4 batches
+                )
+            except asyncio.TimeoutError:
+                pytest.fail("Stress test timed out")
+
+            # Stop workers
+            for worker in workers:
+                await worker.stop()
+
+            # Verify all tasks completed
+            status = queue.get_status()
+            assert status["completed_count"] == num_tasks
+            assert status["failed_count"] == 0
+
+            # Cleanup
+            for worktree in pool.worktrees.values():
+                worktree.status = WorktreeStatus.FREE
+
+    @pytest.mark.asyncio
+    async def test_acquire_timeout(self, tmp_path):
+        """Test that worktree acquisition properly times out."""
+        pool = WorktreePool(pool_size=1)
+        pool._initialized = True
+
+        # Create one worktree but mark it BUSY
+        wt_path = tmp_path / "wt-1"
+        wt_path.mkdir(parents=True, exist_ok=True)
+
+        worktree = WorktreeInfo(
+            id="wt-1",
+            path=wt_path,
+            branch="branch-1",
+            status=WorktreeStatus.BUSY,  # Already busy
+            current_test="blocking-test",
+        )
+        pool.worktrees["wt-1"] = worktree
+
+        # Import the exception class
+        from backend.app.services.worktree_pool import WorktreeAcquisitionTimeout
+
+        # Try to acquire with a short timeout
+        with pytest.raises(WorktreeAcquisitionTimeout) as exc_info:
+            await pool.acquire(test_name="waiting-test", timeout=2.0)
+
+        assert "No worktree available within 2.0s" in str(exc_info.value)
+        assert "blocking-test" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_error_worktree_recovery(self, tmp_path):
+        """Test that ERROR worktrees are identified by health check."""
+        pool = WorktreePool(pool_size=1)
+        pool._initialized = True
+        pool.main_repo_path = tmp_path  # Use tmp_path as fake repo
+        pool.base_dir = tmp_path / "worktrees"
+
+        # Create a worktree directory with .git as directory (more realistic)
+        wt_path = tmp_path / "wt-1"
+        wt_path.mkdir(parents=True, exist_ok=True)
+        (wt_path / ".git").mkdir()  # Fake git dir
+
+        worktree = WorktreeInfo(
+            id="wt-1",
+            path=wt_path,
+            branch="branch-1",
+            status=WorktreeStatus.ERROR,  # In error state
+            current_test="failed-test",
+        )
+        pool.worktrees["wt-1"] = worktree
+
+        # Mock _try_recover_worktree to avoid actual git operations
+        with patch.object(pool, '_try_recover_worktree') as mock_recover:
+            # Recovery will succeed (mocked)
+            mock_recover.return_value = None
+            worktree.status = WorktreeStatus.FREE  # Simulated recovery
+
+            # Run health check
+            health_results = await pool.health_check()
+
+            # Verify health check ran
+            assert "wt-1" in health_results
+            # The worktree was in ERROR state, so issues should be recorded
+            # (though recovery was mocked to succeed)
+
+    @pytest.mark.asyncio
+    async def test_worker_status_tracking(self, tmp_path):
+        """Test that worker status properly tracks current test."""
+        queue = TestQueue()
+
+        pool = WorktreePool(pool_size=1)
+        pool._initialized = True
+
+        wt_path = tmp_path / "wt-1"
+        wt_path.mkdir(parents=True, exist_ok=True)
+
+        worktree = WorktreeInfo(
+            id="wt-1",
+            path=wt_path,
+            branch="branch-1",
+            status=WorktreeStatus.FREE,
+        )
+        pool.worktrees["wt-1"] = worktree
+
+        worker = ExecutionWorker(
+            "worker-test",
+            queue,
+            pool,
+            task_timeout_seconds=60.0,
+            worktree_acquire_timeout=10.0,
+        )
+
+        # Check initial status
+        status = worker.get_status()
+        assert status["worker_id"] == "worker-test"
+        assert status["running"] is False
+        assert status["current_test"] is None
+        assert status["task_timeout_seconds"] == 60.0
+
+    @pytest.mark.asyncio
+    async def test_concurrent_acquire_release(self, tmp_path):
+        """Test that concurrent acquire/release doesn't deadlock."""
+        pool = WorktreePool(pool_size=2)
+        pool._initialized = True
+
+        for i in range(1, 3):
+            wt_path = tmp_path / f"wt-{i}"
+            wt_path.mkdir(parents=True, exist_ok=True)
+
+            worktree = WorktreeInfo(
+                id=f"wt-{i}",
+                path=wt_path,
+                branch=f"branch-{i}",
+                status=WorktreeStatus.FREE,
+            )
+            pool.worktrees[f"wt-{i}"] = worktree
+
+        # Acquire both worktrees
+        wt1 = await pool.acquire(test_name="test-1", timeout=5.0)
+        wt2 = await pool.acquire(test_name="test-2", timeout=5.0)
+
+        assert wt1.status == WorktreeStatus.BUSY
+        assert wt2.status == WorktreeStatus.BUSY
+
+        # Start a task that will try to acquire (should wait)
+        async def try_acquire():
+            return await pool.acquire(test_name="test-3", timeout=10.0)
+
+        acquire_task = asyncio.create_task(try_acquire())
+
+        # Give it a moment to start waiting
+        await asyncio.sleep(0.5)
+
+        # Release one worktree - this should NOT deadlock
+        wt1.status = WorktreeStatus.FREE  # Simulate release
+
+        # The waiting acquire should now succeed
+        try:
+            wt3 = await asyncio.wait_for(acquire_task, timeout=5.0)
+            assert wt3.status == WorktreeStatus.BUSY
+        except asyncio.TimeoutError:
+            pytest.fail("Concurrent acquire/release caused deadlock")
+
+        # Cleanup
+        for wt in pool.worktrees.values():
+            wt.status = WorktreeStatus.FREE

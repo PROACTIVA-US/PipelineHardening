@@ -344,6 +344,23 @@ class TaskExecutor:
         prompt_file.write_text(prompt)
 
         try:
+            # Build environment with proper PATH for Claude CLI
+            # macOS homebrew installs to /opt/homebrew/bin which may not be in subprocess PATH
+            env = os.environ.copy()
+            env["CLAUDE_AUTO_ACCEPT"] = "1"
+
+            # Ensure common tool paths are available
+            extra_paths = [
+                "/opt/homebrew/bin",  # macOS Apple Silicon homebrew
+                "/usr/local/bin",      # macOS Intel homebrew / Linux
+                "/usr/bin",
+            ]
+            current_path = env.get("PATH", "")
+            for extra_path in extra_paths:
+                if extra_path not in current_path:
+                    current_path = f"{extra_path}:{current_path}"
+            env["PATH"] = current_path
+
             # Run claude CLI
             # Using --print for non-interactive mode, -p for prompt from stdin
             result = subprocess.run(
@@ -352,7 +369,7 @@ class TaskExecutor:
                 capture_output=True,
                 text=True,
                 timeout=1800,  # 30 minute timeout
-                env={**os.environ, "CLAUDE_AUTO_ACCEPT": "1"},
+                env=env,
             )
 
             output = result.stdout + result.stderr

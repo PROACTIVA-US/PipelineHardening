@@ -3,13 +3,24 @@
 import asyncio
 import subprocess
 import logging
+import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 
 logger = logging.getLogger(__name__)
+
+
+class WorktreeAcquisitionTimeout(Exception):
+    """Raised when worktree acquisition times out."""
+    pass
+
+
+class WorktreeRecoveryFailed(Exception):
+    """Raised when worktree recovery fails."""
+    pass
 
 
 class WorktreeStatus(Enum):
@@ -138,24 +149,48 @@ class WorktreePool:
 
         self.worktrees[wt_id] = info
 
-    async def acquire(self, test_name: Optional[str] = None) -> WorktreeInfo:
+    async def acquire(
+        self,
+        test_name: Optional[str] = None,
+        timeout: float = 300.0,
+    ) -> WorktreeInfo:
         """
         Acquire an available worktree from the pool.
 
-        Blocks if all worktrees are busy until one becomes available.
+        Blocks if all worktrees are busy until one becomes available or timeout.
 
         Args:
             test_name: Name of test that will use this worktree (for tracking)
+            timeout: Maximum seconds to wait for a worktree (default: 300s / 5 minutes)
 
         Returns:
             WorktreeInfo for the acquired worktree
+
+        Raises:
+            WorktreeAcquisitionTimeout: If no worktree available within timeout
+            Exception: If pool not initialized
         """
         if not self._initialized:
             raise Exception("Worktree pool not initialized. Call initialize() first.")
 
-        async with self._lock:
-            # Find free worktree
-            while True:
+        deadline = time.time() + timeout
+        attempt = 0
+
+        while time.time() < deadline:
+            attempt += 1
+
+            # Acquire lock only for the check-and-acquire operation (not during sleep)
+            async with self._lock:
+                # First, try to recover any ERROR worktrees
+                for wt_id, info in self.worktrees.items():
+                    if info.status == WorktreeStatus.ERROR:
+                        logger.info(f"Attempting to recover ERROR worktree {wt_id}")
+                        try:
+                            await self._try_recover_worktree(wt_id)
+                        except Exception as e:
+                            logger.warning(f"Failed to recover worktree {wt_id}: {e}")
+
+                # Find free worktree
                 for wt_id, info in self.worktrees.items():
                     if info.status == WorktreeStatus.FREE:
                         # Mark as busy
@@ -165,9 +200,31 @@ class WorktreePool:
                         logger.info(f"Acquired worktree {wt_id} for test: {test_name}")
                         return info
 
-                # No free worktrees, wait and retry
-                logger.debug("All worktrees busy, waiting...")
-                await asyncio.sleep(1)
+            # No free worktrees - release lock and wait before retry
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+
+            if attempt % 10 == 0:  # Log every 10 attempts
+                logger.warning(
+                    f"All worktrees busy, waiting... (attempt {attempt}, "
+                    f"{remaining:.1f}s remaining)"
+                )
+            else:
+                logger.debug(f"All worktrees busy, waiting... (attempt {attempt})")
+
+            await asyncio.sleep(min(1.0, remaining))
+
+        # Timeout reached
+        busy_worktrees = [
+            f"{wt_id}:{info.current_test}"
+            for wt_id, info in self.worktrees.items()
+            if info.status == WorktreeStatus.BUSY
+        ]
+        raise WorktreeAcquisitionTimeout(
+            f"No worktree available within {timeout}s. "
+            f"Busy worktrees: {busy_worktrees}"
+        )
 
     async def release(self, worktree: WorktreeInfo) -> None:
         """
@@ -332,6 +389,105 @@ class WorktreePool:
 
         if wt_id in self.worktrees:
             del self.worktrees[wt_id]
+
+    async def _try_recover_worktree(self, wt_id: str) -> None:
+        """
+        Attempt to recover a worktree in ERROR state.
+
+        Args:
+            wt_id: ID of worktree to recover
+
+        Raises:
+            WorktreeRecoveryFailed: If recovery fails
+        """
+        info = self.worktrees.get(wt_id)
+        if not info:
+            raise WorktreeRecoveryFailed(f"Unknown worktree: {wt_id}")
+
+        if info.status != WorktreeStatus.ERROR:
+            logger.debug(f"Worktree {wt_id} not in ERROR state, skipping recovery")
+            return
+
+        logger.info(f"Attempting recovery of worktree {wt_id}")
+
+        try:
+            # Try to clean the worktree
+            await self._cleanup_worktree(info)
+
+            # If cleanup succeeded, mark as FREE
+            info.status = WorktreeStatus.FREE
+            info.current_test = None
+            logger.info(f"✓ Recovered worktree {wt_id}")
+
+        except Exception as e:
+            logger.warning(f"Cleanup failed for {wt_id}, attempting full recreate: {e}")
+
+            try:
+                # Remove and recreate the worktree
+                await self._remove_worktree_directory(wt_id)
+                await self._create_worktree(wt_id)
+                logger.info(f"✓ Recreated worktree {wt_id}")
+
+            except Exception as recreate_error:
+                raise WorktreeRecoveryFailed(
+                    f"Failed to recover worktree {wt_id}: {recreate_error}"
+                )
+
+    async def health_check(self) -> Dict[str, dict]:
+        """
+        Perform health check on all worktrees and attempt recovery of ERROR ones.
+
+        Returns:
+            Dictionary with health status for each worktree
+        """
+        results = {}
+
+        # Create a copy of items to avoid mutation during iteration
+        worktree_items = list(self.worktrees.items())
+
+        for wt_id, info in worktree_items:
+            health = {
+                "id": wt_id,
+                "status": info.status.value,
+                "healthy": True,
+                "issues": [],
+            }
+
+            # Check if path exists
+            if not info.path.exists():
+                health["healthy"] = False
+                health["issues"].append("Path does not exist")
+
+            # Check if it's a valid git repo
+            elif not (info.path / ".git").exists():
+                health["healthy"] = False
+                health["issues"].append("Not a valid git repository")
+
+            # Check for ERROR status
+            if info.status == WorktreeStatus.ERROR:
+                health["healthy"] = False
+                health["issues"].append("Worktree in ERROR state")
+
+                # Attempt recovery
+                try:
+                    await self._try_recover_worktree(wt_id)
+                    health["recovered"] = True
+                    health["status"] = self.worktrees[wt_id].status.value
+                except WorktreeRecoveryFailed as e:
+                    health["recovered"] = False
+                    health["recovery_error"] = str(e)
+
+            # Check for stuck BUSY worktrees (busy for > 30 minutes)
+            if info.status == WorktreeStatus.BUSY and info.last_used:
+                busy_duration = (datetime.now(timezone.utc) - info.last_used).total_seconds()
+                if busy_duration > 1800:  # 30 minutes
+                    health["issues"].append(
+                        f"Worktree busy for {busy_duration/60:.1f} minutes (may be stuck)"
+                    )
+
+            results[wt_id] = health
+
+        return results
 
     def get_status(self) -> Dict[str, dict]:
         """

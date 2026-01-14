@@ -2,16 +2,22 @@
 
 import asyncio
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 from datetime import datetime, timezone
 
 from .test_queue import TestQueue, TestRequest, TestResult, TestStatus
-from .worktree_pool import WorktreePool, WorktreeInfo
+from .worktree_pool import WorktreePool, WorktreeInfo, WorktreeAcquisitionTimeout
 from .plan_parser import PlanParser, PlanParseError
 from .task_executor import TaskExecutor
 
 logger = logging.getLogger(__name__)
+
+
+class WorkerTaskTimeout(Exception):
+    """Raised when a worker task exceeds its timeout."""
+    pass
 
 
 class ExecutionWorker:
@@ -27,6 +33,8 @@ class ExecutionWorker:
         worker_id: str,
         queue: TestQueue,
         pool: WorktreePool,
+        task_timeout_seconds: float = 1800.0,  # 30 minutes default
+        worktree_acquire_timeout: float = 300.0,  # 5 minutes default
     ):
         """
         Initialize execution worker.
@@ -35,12 +43,18 @@ class ExecutionWorker:
             worker_id: Unique identifier for this worker (e.g., "worker-1")
             queue: Test queue to pull tests from
             pool: Worktree pool to acquire worktrees from
+            task_timeout_seconds: Maximum time for a single task execution (default: 30 min)
+            worktree_acquire_timeout: Maximum time to wait for a worktree (default: 5 min)
         """
         self.worker_id = worker_id
         self.queue = queue
         self.pool = pool
+        self.task_timeout_seconds = task_timeout_seconds
+        self.worktree_acquire_timeout = worktree_acquire_timeout
         self.running = False
         self._task: Optional[asyncio.Task] = None
+        self._current_test: Optional[str] = None
+        self._current_test_started: Optional[datetime] = None
 
     async def start(self) -> None:
         """Start the worker loop in a background task."""
@@ -112,21 +126,39 @@ class ExecutionWorker:
             f"(id: {test_request.id})"
         )
 
+        # Track current test for watchdog
+        self._current_test = test_request.id
+        self._current_test_started = datetime.now(timezone.utc)
+
         # 2. Mark test as running
         await self.queue.mark_running(test_request)
 
         worktree: Optional[WorktreeInfo] = None
 
         try:
-            # 3. Acquire worktree from pool
-            worktree = await self.pool.acquire(test_name=test_request.plan_file)
-            logger.info(
-                f"Worker {self.worker_id} acquired worktree {worktree.id} "
-                f"for test {test_request.id}"
-            )
+            # 3. Acquire worktree from pool (with timeout)
+            try:
+                worktree = await self.pool.acquire(
+                    test_name=test_request.plan_file,
+                    timeout=self.worktree_acquire_timeout,
+                )
+                logger.info(
+                    f"Worker {self.worker_id} acquired worktree {worktree.id} "
+                    f"for test {test_request.id}"
+                )
+            except WorktreeAcquisitionTimeout as e:
+                raise WorkerTaskTimeout(f"Failed to acquire worktree: {e}")
 
-            # 4. Execute test in worktree
-            result = await self._execute_test(test_request, worktree)
+            # 4. Execute test in worktree (with timeout)
+            try:
+                result = await asyncio.wait_for(
+                    self._execute_test(test_request, worktree),
+                    timeout=self.task_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                raise WorkerTaskTimeout(
+                    f"Task execution exceeded timeout of {self.task_timeout_seconds}s"
+                )
 
             # 5. Handle result - complete or retry
             if result.status == "COMPLETE":
@@ -148,6 +180,22 @@ class ExecutionWorker:
                         f"after {test_request.retry_count} retries: {result.error}"
                     )
 
+        except WorkerTaskTimeout as e:
+            # Timeout-specific handling
+            logger.error(f"Worker {self.worker_id} task timeout: {e}")
+
+            result = TestResult(
+                test_request_id=test_request.id,
+                worktree_id=worktree.id if worktree else "unknown",
+                status="FAILED",
+                error=f"Timeout: {str(e)}",
+                started_at=self._current_test_started,
+                completed_at=datetime.now(timezone.utc),
+            )
+
+            # Don't retry timeouts - they'll likely timeout again
+            await self.queue.mark_failed(test_request.id, result)
+
         except Exception as e:
             # Worker-level error (not test execution error)
             logger.error(f"Worker {self.worker_id} error processing test: {e}")
@@ -166,6 +214,10 @@ class ExecutionWorker:
                 await self.queue.mark_failed(test_request.id, result)
 
         finally:
+            # Clear current test tracking
+            self._current_test = None
+            self._current_test_started = None
+
             # 6. Always release worktree back to pool
             if worktree:
                 try:
@@ -206,9 +258,10 @@ class ExecutionWorker:
                 test_request, worktree, started_at
             )
 
+            duration_str = f"{result.duration_seconds:.1f}s" if result.duration_seconds else "N/A"
             logger.info(
                 f"Worker {self.worker_id} test {test_request.id} completed "
-                f"in {result.duration_seconds:.1f}s"
+                f"in {duration_str}"
             )
 
             return result
@@ -344,8 +397,22 @@ class ExecutionWorker:
         Returns:
             Dictionary with worker status information
         """
-        return {
+        status = {
             "worker_id": self.worker_id,
             "running": self.running,
             "task_done": self._task.done() if self._task else True,
+            "current_test": self._current_test,
+            "task_timeout_seconds": self.task_timeout_seconds,
         }
+
+        # Add elapsed time if processing a test
+        if self._current_test_started:
+            elapsed = (datetime.now(timezone.utc) - self._current_test_started).total_seconds()
+            status["current_test_elapsed_seconds"] = elapsed
+            status["current_test_started"] = self._current_test_started.isoformat()
+
+            # Warn if approaching timeout
+            if elapsed > self.task_timeout_seconds * 0.8:
+                status["warning"] = "Approaching task timeout"
+
+        return status
